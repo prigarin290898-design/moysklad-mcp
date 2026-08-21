@@ -41,18 +41,24 @@ const allTools: ToolDef[] = [
   ...auditTools,
 ];
 
-const server = new McpServer({ name: "moysklad-mcp", version: VERSION });
-
 const wrap = (handler: (params: any) => Promise<string>) => async (params: any) => ({
   content: [{ type: "text" as const, text: await handler(params) }],
 });
 
-const seen = new Set<string>();
-for (const t of allTools) {
-  if (seen.has(t.name)) throw new Error(`Duplicate tool name: ${t.name}`);
-  seen.add(t.name);
-  server.tool(t.name, t.description, t.schema.shape, wrap(t.handler));
+function buildServer(): McpServer {
+  const s = new McpServer({ name: "moysklad-mcp", version: VERSION });
+  const seen = new Set<string>();
+  for (const t of allTools) {
+    if (seen.has(t.name)) throw new Error(`Duplicate tool name: ${t.name}`);
+    seen.add(t.name);
+    s.tool(t.name, t.description, t.schema.shape, wrap(t.handler));
+  }
+  return s;
 }
+
+// Module-level singleton, used by stdio mode (a single long-lived process
+// talking to a single client) and exported for anything importing `server`.
+const server = buildServer();
 
 const TOOL_COUNT = allTools.length;
 
@@ -73,7 +79,6 @@ async function main() {
 async function startHttpTransport(port: number) {
   const { createServer } = await import("node:http");
   const { StreamableHTTPServerTransport } = await import("@modelcontextprotocol/sdk/server/streamableHttp.js");
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as unknown as () => string });
   // CORS is opt-in: only emit Access-Control-Allow-Origin when explicitly
   // configured. The HTTP transport exposes tools that act on the configured
   // MoySklad token, so a wildcard default would let any web page drive it.
@@ -95,13 +100,26 @@ async function startHttpTransport(port: number) {
       return;
     }
     if (req.url === "/mcp") {
-      await transport.handleRequest(req, res);
+      // Stateless mode (sessionIdGenerator: undefined) only supports a
+      // single request per transport instance in the current SDK — reusing
+      // one shared transport across requests made every request after the
+      // first fail with an empty 500. Build a fresh server + transport for
+      // every call instead, and tear both down when the response closes.
+      const requestServer = buildServer();
+      const requestTransport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined as unknown as () => string,
+      });
+      res.on("close", () => {
+        requestTransport.close();
+        requestServer.close();
+      });
+      await requestServer.connect(requestTransport);
+      await requestTransport.handleRequest(req, res);
       return;
     }
     res.writeHead(404);
     res.end("Not found. Use /mcp or /health.");
   });
-  await server.connect(transport);
   httpServer.listen(port, () => {
     console.error(`[moysklad-mcp] HTTP server on port ${port}. ${TOOL_COUNT} tools available.`);
   });
